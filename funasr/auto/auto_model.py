@@ -659,6 +659,37 @@ class AutoModel:
                 kwargs contains the resolved configuration.
         """
         assert "model" in kwargs
+        backend = str(kwargs.get("backend", "pytorch")).lower()
+        if backend not in {"pytorch", "openvino"}:
+            raise ValueError("backend must be 'pytorch' or 'openvino'")
+
+        if backend == "openvino":
+            source_model_dir = kwargs.get("openvino_source_model_dir")
+            if source_model_dir is None and os.path.isdir(kwargs["model"]):
+                source_model_dir = kwargs["model"]
+            if source_model_dir is None:
+                kwargs = download_model(**kwargs)
+                source_model_dir = kwargs.get("model_path")
+            if source_model_dir is None:
+                raise ValueError("backend='openvino' could not resolve the Fun-ASR-Nano source model")
+            source_model_dir = os.path.abspath(os.path.expanduser(source_model_dir))
+            config_path = os.path.join(source_model_dir, "config.yaml")
+            if not os.path.isfile(config_path):
+                raise FileNotFoundError(f"FunASR source config not found: {config_path}")
+            from omegaconf import OmegaConf
+
+            model_config = OmegaConf.load(config_path)
+            if model_config.get("model") != "FunASRNano":
+                raise ValueError(
+                    "backend='openvino' currently supports Fun-ASR-Nano only; "
+                    f"source config declares model={model_config.get('model')!r}"
+                )
+            kwargs = OmegaConf.to_container(OmegaConf.merge(model_config, kwargs), resolve=True)
+            kwargs["model"] = "FunASRNano"
+            kwargs["model_path"] = source_model_dir
+            kwargs["openvino_source_model_dir"] = source_model_dir
+            kwargs["tokenizer"] = None
+
         # Silero VAD is loaded by its optional Python package rather than a
         # FunASR model repository. Supplying model_conf keeps it on the normal
         # AutoModel construction path while bypassing hub config resolution.
@@ -781,11 +812,16 @@ class AutoModel:
         model_conf = {}
         deep_update(model_conf, kwargs.get("model_conf", {}))
         deep_update(model_conf, kwargs)
-        model = model_class(**model_conf)
+        if backend == "openvino":
+            from funasr.models.fun_asr_nano.openvino_backend import FunASRNanoOpenVINO
+
+            model = FunASRNanoOpenVINO(**model_conf)
+        else:
+            model = model_class(**model_conf)
 
         # init_param
         init_param = kwargs.get("init_param", None)
-        if init_param is not None:
+        if init_param is not None and not getattr(model, "skip_init_param", False):
             if os.path.exists(init_param):
                 logging.info(f"Loading pretrained params from {init_param}")
                 load_pretrained_model(
@@ -986,7 +1022,9 @@ class AutoModel:
             # pbar.update(1)
             pbar.set_description(f"rtf_avg: {time_escape_total/time_speech_total:0.3f}")
 
-        device = next(model.parameters()).device
+        parameters = getattr(model, "parameters", None)
+        first_parameter = next(parameters(), None) if callable(parameters) else None
+        device = first_parameter.device if first_parameter is not None else torch.device("cpu")
         if device.type == "cuda":
             with torch.cuda.device(device):
                 torch.cuda.empty_cache()
@@ -1311,7 +1349,10 @@ class AutoModel:
                                 for t in rest["timestamps"]
                             ]
                         else:
-                            logging.error("No timestamp found in ASR result. Speaker diarization relies on timestamps.")
+                            logging.debug(
+                                "ASR returned no token timestamps; using VAD segment boundaries "
+                                "for speaker diarization."
+                            )
                             ts = []
                         sentence_list.append(
                             {

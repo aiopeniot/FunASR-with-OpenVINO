@@ -17,6 +17,11 @@
 | 参数 | 代码回退默认值 | 含义 |
 |---|---|---|
 | `model` | 必填 | 模型平台别名、完整模型 ID 或完整本地模型目录。别名依赖平台，不是版本锁定。 |
+| `backend` | `"pytorch"` | Fun-ASR-Nano 支持 `"pytorch"` 或 `"openvino"`。OpenVINO 只替换 Nano ASR 推理引擎，`generate()`、VAD 与说话人流程仍由 FunASR 管理。 |
+| `openvino_model_dir` | `None` | Fun-ASR-Nano 已导出的 OpenVINO IR 目录。使用 `backend="openvino"` 时必填。 |
+| `openvino_source_model_dir` | `None` | 含 `config.yaml` 的 Fun-ASR-Nano 源模型目录；可省略并直接把该目录传给 `model`。OpenVINO backend 不加载其中的 PyTorch `model.pt`。 |
+| `openvino_device` | `"CPU"` | OpenVINO 插件设备，例如 `"CPU"`、`"GPU"` 或 `"NPU"`。FunASR `device` 仍控制 VAD/CAM++ 等 PyTorch 组件。 |
+| `openvino_config` | CPU: `None`；GPU 未指定时 encoder 使用 FP16、decoder 使用 FP32 | 显式配置会原样应用到所有 OpenVINO 组件；GPU 默认将 encoder 设为 FP16、decoder（含 past decoder）设为 FP32，以避免 Arc Pro B60 上 decoder FP16 生成全零 token。 |
 | `hub` | `"ms"` | `"ms"`/`"modelscope"` 或 `"hf"`/`"huggingface"`。特殊的 `"openai"` 分支用于 Whisper 加载，不代表 HTTP API 兼容性。 |
 | `model_revision` | 平台加载器中为 `"master"` | ModelScope 会向下载器转发此版本。通用 Hugging Face 下载助手当前会忽略它，详见复现说明。 |
 | `device` | `"cuda"` | 例如 `"cuda:0"` 或 `"cpu"`。经检查不可用的加速后端会回退到 CPU；显式 `ngpu=0` 也会如此，并设置 `batch_size=1`。 |
@@ -50,6 +55,33 @@
 | `return_raw_text` | `False` | 在实际应用标点的路径上保留标点前文本，不保证所有路径都返回该字段。 |
 
 `generate()` 在合并本次选项前恢复构建时保存的配置。每次调用都应明确传入本次需要的语言、批处理、热词等选项，不要依赖上一次调用遗留的值。配置重置不代表线程安全，也不重置每个模型属性，例如说话人模式回退会修改 `self.spk_mode`。除非自行验证过并发行为，否则应串行访问共享实例。
+
+### Fun-ASR-Nano OpenVINO backend
+
+OpenVINO 是 FunASR `AutoModel` 内的可选 Nano 推理后端，不是另一个服务接口。先按 [Optimum Intel 导出流程](../examples/openvino/README.md)准备 IR，再继续用熟悉的 `generate()` 调用；VAD/CAM++ 等辅助组件仍由 FunASR 按 `device` 加载：
+
+安装源码包后，在当前 Python 环境安装 OpenVINO 后端依赖（版本应与导出 IR 的环境一致）：
+
+```bash
+python -m pip install "optimum-intel" "openvino>=2025.4" openvino-tokenizers "transformers==4.57.6"
+```
+
+```python
+from funasr import AutoModel
+
+model = AutoModel(
+    model="/models/source/Fun-ASR-Nano-2512",
+    backend="openvino",
+    openvino_model_dir="/models/openvino/nano",
+    openvino_device="CPU",
+    device="cpu",
+    vad_model="fsmn-vad",
+    spk_model="cam++",
+)
+result = model.generate(input="meeting.wav", language="zh")
+```
+
+也可把远端模型 ID 用作 `model`，并额外提供本地 `openvino_source_model_dir`；这样 FunASR 从源目录读取配置，而不重新下载/加载 PyTorch 权重。存在 `openvino_detokenizer.xml` 时，backend 用它把生成的 token ID 解码成文本；没有该 IR 时回退到 `AutoTokenizer.decode()`。OpenVINO backend 当前不提供 CTC forced-alignment 时间戳或模型内热词解码；配置 `spk_model` 时沿用 FunASR 的 VAD 段级 speaker 标注，不代表词级对齐。`backend` 默认仍为 `pytorch`，其他 FunASR 模型不接受 `backend="openvino"`。
 
 ### 为子模型分别指定设备
 
